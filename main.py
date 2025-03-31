@@ -1,58 +1,74 @@
+# Auto Upload Server: Tải video từ Google Drive và đẩy link về Make.com
+
 from flask import Flask, request, jsonify
-import os
 import requests
-import tempfile
-import gdown
+import io
+import threading
+import os
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 app = Flask(__name__)
 
-# Tải file từ Google Drive (link công khai)
-def download_file_from_drive(share_url):
-    try:
-        output = tempfile.NamedTemporaryFile(delete=False).name
-        gdown.download(url=share_url, output=output, quiet=False, fuzzy=True)
-        return output
-    except Exception as e:
-        print("Error downloading:", e)
-        return None
+# ==== CONFIG ==== #
+SECRET_KEY = "YOUR_SECRET_KEY"  # Để xác thực khi nhận request
+SERVICE_ACCOUNT_FILE = "service-account.json"  # File key của Google Service Account
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+PORT = int(os.environ.get("PORT", 5000))
 
-# Upload file lên transfer.sh và trả về link công khai
-def upload_to_transfersh(file_path):
-    try:
-        filename = os.path.basename(file_path)
-        with open(file_path, 'rb') as f:
-            response = requests.put(f'https://transfer.sh/{filename}', data=f)
-        if response.status_code == 200:
-            return response.text.strip()
-        else:
-            print("Upload failed:", response.text)
-            return None
-    except Exception as e:
-        print("Upload error:", e)
-        return None
+# ==== INIT GOOGLE DRIVE API ==== #
+creds = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=SCOPES
+)
+drive_service = build('drive', 'v3', credentials=creds)
 
-# Xử lý webhook POST
-@app.route('/upload', methods=['POST'])
-def handle_upload():
+# ==== DOWNLOAD FILE FROM GOOGLE DRIVE ==== #
+def download_file_from_drive(file_id):
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh
+
+# ==== UPLOAD FILE TO TRANSFER.SH ==== #
+def upload_to_transfersh(file_stream, filename):
+    files = {'file': (filename, file_stream)}
+    response = requests.post(f'https://transfer.sh/{filename}', files=files)
+    return response.text.strip()
+
+# ==== BACKGROUND JOB ==== #
+def process_download(file_id, filename, callback_url):
+    try:
+        file_stream = download_file_from_drive(file_id)
+        public_url = upload_to_transfersh(file_stream, filename)
+        result = {"file_id": file_id, "public_url": public_url}
+        requests.post(callback_url, json=result)
+    except Exception as e:
+        error_result = {"file_id": file_id, "error": str(e)}
+        requests.post(callback_url, json=error_result)
+
+# ==== API ENDPOINT ==== #
+@app.route('/download', methods=['POST'])
+def download():
     data = request.get_json()
-    drive_link = data.get('drive_link')
+    file_id = data.get('file_id')
+    callback_url = data.get('callback_url')
+    secret = data.get('secret')
+    filename = data.get('filename', f"{file_id}.mp4")
 
-    if not drive_link:
-        return jsonify({"error": "Missing drive_link"}), 400
+    if secret != SECRET_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    if not file_id or not callback_url:
+        return jsonify({"error": "Missing file_id or callback_url"}), 400
 
-    downloaded_file = download_file_from_drive(drive_link)
+    threading.Thread(target=process_download, args=(file_id, filename, callback_url)).start()
+    return jsonify({"status": "processing"}), 202
 
-    if not downloaded_file:
-        return jsonify({"error": "Failed to download file"}), 400
-
-    public_url = upload_to_transfersh(downloaded_file)
-    os.remove(downloaded_file)
-
-    if public_url:
-        return jsonify({"public_url": public_url})
-    else:
-        return jsonify({"error": "Failed to upload to transfer.sh"}), 500
-
-# Khởi động server Flask
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# ==== START SERVER ==== #
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT)
